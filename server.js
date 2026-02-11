@@ -1,12 +1,6 @@
 /**
- * ZALO PROXY SERVER - Node.js + Puppeteer
- * Deploy lên Heroku/Vercel/Railway để bypass Zalo login
- * 
- * CÁCH CÀI ĐẶT:
- * 1. npm init -y
- * 2. npm install express puppeteer
- * 3. node server.js
- * 4. Deploy lên Heroku hoặc Railway
+ * ZALO PROXY SERVER - FIXED VERSION
+ * Extract name from <title> tag since content is JS-rendered
  */
 
 const express = require('express');
@@ -16,18 +10,18 @@ const puppeteer = require('puppeteer-core');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Cache để giảm số lần scrape
+// Cache
 const cache = new Map();
 const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 giờ
 
-// Middleware CORS
+// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
 
-// Endpoint check Zalo
+// Main API endpoint
 app.get('/api/zalo', async (req, res) => {
   const phone = req.query.phone;
   
@@ -35,50 +29,60 @@ app.get('/api/zalo', async (req, res) => {
     return res.status(400).json({ error: 'Missing phone parameter' });
   }
   
-  // Chuẩn hóa số điện thoại
   const cleanPhone = phone.toString().trim().replace(/\s/g, '').replace(/\+84/, '0');
   
-  // Kiểm tra cache
+  // Check cache
   const cacheKey = `zalo_${cleanPhone}`;
   const cached = cache.get(cacheKey);
   
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    console.log(`Cache hit for ${cleanPhone}`);
+    console.log(`✅ Cache hit for ${cleanPhone}`);
     return res.json(cached.data);
   }
   
   try {
-    console.log(`Scraping Zalo for ${cleanPhone}...`);
+    console.log(`🔍 Scraping Zalo for ${cleanPhone}...`);
     
-const browser = await puppeteer.launch({
-  args: chromium.args,
-  defaultViewport: chromium.defaultViewport,
-  executablePath: await chromium.executablePath(),
-  headless: chromium.headless,
-});
-
+    const browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
     
     const page = await browser.newPage();
     
     // Set user agent
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    // Navigate to Zalo profile
+    // Navigate
     const url = `https://zalo.me/${cleanPhone}`;
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 10000 });
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 15000 });
     
-    // Wait a bit for dynamic content
-    await page.waitForTimeout(2000);
+    // Wait longer for JS to render
+    await page.waitForTimeout(4000);
     
-    // Extract name from multiple possible selectors
+    // Extract data
     const result = await page.evaluate(() => {
-      // Try multiple selectors
+      // Method 1: From <title> tag (MOST RELIABLE)
+      const title = document.title;
+      if (title && title.includes(' - ')) {
+        const name = title.split(' - ')[1]?.replace('Zalo', '').trim();
+        if (name && name.length > 0 && name !== 'Zalo') {
+          return {
+            name: name,
+            status: 'Tồn tại',
+            method: 'title'
+          };
+        }
+      }
+      
+      // Method 2: From rendered content
       const selectors = [
         'h1.main__name',
         '.main__name',
-        '.card-name',
         'h1[class*="name"]',
-        '[data-name]'
+        '[class*="card-name"]'
       ];
       
       for (const selector of selectors) {
@@ -86,36 +90,43 @@ const browser = await puppeteer.launch({
         if (element && element.textContent.trim()) {
           return {
             name: element.textContent.trim(),
-            status: 'Tồn tại'
+            status: 'Tồn tại',
+            method: selector
           };
         }
       }
       
-      // Check for error messages
+      // Method 3: Check for error message
       const body = document.body.innerHTML;
       if (body.includes('Tài khoản này không tồn tại') || 
           body.includes('không cho phép tìm kiếm')) {
         return {
           name: '',
-          status: 'Không tồn tại'
+          status: 'Không tồn tại',
+          method: 'error'
         };
       }
       
-      // Try to get from meta tags
+      // Method 4: From meta og:title
       const metaTitle = document.querySelector('meta[property="og:title"]');
       if (metaTitle) {
-        const title = metaTitle.getAttribute('content');
-        if (title && !title.includes('Zalo') && title.length > 0) {
-          return {
-            name: title.replace(/\s*-\s*Zalo\s*$/i, ''),
-            status: 'Tồn tại'
-          };
+        const content = metaTitle.getAttribute('content');
+        if (content && content.includes(' - ')) {
+          const name = content.split(' - ')[1]?.replace('Zalo', '').trim();
+          if (name && name.length > 0) {
+            return {
+              name: name,
+              status: 'Tồn tại',
+              method: 'meta'
+            };
+          }
         }
       }
       
       return {
         name: '',
-        status: 'Không xác định'
+        status: 'Không xác định',
+        method: 'none'
       };
     });
     
@@ -128,17 +139,17 @@ const browser = await puppeteer.launch({
       timestamp: new Date().toISOString()
     };
     
-    // Lưu cache
+    // Save to cache
     cache.set(cacheKey, {
       data: response,
       timestamp: Date.now()
     });
     
-    console.log(`Result for ${cleanPhone}:`, response);
+    console.log(`✅ Result for ${cleanPhone}:`, response);
     res.json(response);
     
   } catch (error) {
-    console.error('Error:', error);
+    console.error('❌ Error:', error.message);
     res.status(500).json({
       phone: cleanPhone,
       name: '',
@@ -148,30 +159,56 @@ const browser = await puppeteer.launch({
   }
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', cache_size: cache.size });
+  res.json({ 
+    status: 'OK', 
+    cache_size: cache.size,
+    uptime: process.uptime()
+  });
 });
 
-// Clear cache endpoint
+// Clear cache
 app.post('/cache/clear', (req, res) => {
+  const size = cache.size;
   cache.clear();
-  res.json({ message: 'Cache cleared', cache_size: 0 });
+  res.json({ 
+    message: 'Cache cleared', 
+    cleared: size,
+    cache_size: 0 
+  });
+});
+
+// Homepage
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Zalo Proxy Server',
+    endpoints: {
+      health: '/health',
+      api: '/api/zalo?phone=0398981698',
+      clearCache: '/cache/clear (POST)'
+    }
+  });
 });
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Zalo Proxy Server running on port ${PORT}`);
-  console.log(`📍 API Endpoint: http://localhost:${PORT}/api/zalo?phone=0398981698`);
+  console.log(`📍 Health: http://localhost:${PORT}/health`);
+  console.log(`📍 API: http://localhost:${PORT}/api/zalo?phone=0398981698`);
 });
 
-// Clear old cache every hour
+// Auto clear old cache every hour
 setInterval(() => {
   const now = Date.now();
+  let cleared = 0;
   for (const [key, value] of cache.entries()) {
     if (now - value.timestamp > CACHE_TTL) {
       cache.delete(key);
+      cleared++;
     }
   }
-  console.log(`🧹 Cache cleaned. Current size: ${cache.size}`);
+  if (cleared > 0) {
+    console.log(`🧹 Auto-cleared ${cleared} expired cache entries`);
+  }
 }, 60 * 60 * 1000);
