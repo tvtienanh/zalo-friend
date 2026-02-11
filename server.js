@@ -1,11 +1,10 @@
 /**
- * ZALO PROXY SERVER - FIXED VERSION
- * Extract name from <title> tag since content is JS-rendered
+ * ZALO PROXY SERVER - SIMPLE VERSION
+ * No Puppeteer - Just fetch HTML and parse <title>
  */
 
 const express = require('express');
-const chromium = require('@sparticuz/chromium');
-const puppeteer = require('puppeteer-core');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,6 +19,123 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
+
+// Fetch HTML from Zalo
+function fetchZaloPage(phone) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'zalo.me',
+      path: `/${phone}`,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+      }
+    };
+
+    const req = https.request(options, (response) => {
+      let data = '';
+
+      // Handle gzip
+      const encoding = response.headers['content-encoding'];
+      let stream = response;
+      
+      if (encoding === 'gzip') {
+        const zlib = require('zlib');
+        stream = response.pipe(zlib.createGunzip());
+      }
+
+      stream.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      stream.on('end', () => {
+        resolve(data);
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(error);
+    });
+
+    req.setTimeout(10000, () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+
+    req.end();
+  });
+}
+
+// Extract name from HTML
+function extractName(html) {
+  // Method 1: From <title> tag
+  const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+  if (titleMatch && titleMatch[1]) {
+    const title = titleMatch[1];
+    // Format: "Zalo - Vũ Thị Nhài" or "Tên Người Dùng - Zalo"
+    if (title.includes(' - ')) {
+      const parts = title.split(' - ');
+      for (const part of parts) {
+        const cleaned = part.trim();
+        if (cleaned && cleaned !== 'Zalo' && cleaned.length > 1) {
+          return cleaned;
+        }
+      }
+    }
+  }
+
+  // Method 2: From meta og:title
+  const metaMatch = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i);
+  if (metaMatch && metaMatch[1]) {
+    const content = metaMatch[1];
+    if (content.includes(' - ')) {
+      const parts = content.split(' - ');
+      for (const part of parts) {
+        const cleaned = part.trim();
+        if (cleaned && cleaned !== 'Zalo' && cleaned.length > 1) {
+          return cleaned;
+        }
+      }
+    }
+  }
+
+  // Method 3: From meta description
+  const descMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i);
+  if (descMatch && descMatch[1]) {
+    const desc = descMatch[1];
+    // Extract name from description
+    const nameMatch = desc.match(/Zalo\s*-\s*([^(]+)/i);
+    if (nameMatch && nameMatch[1]) {
+      return nameMatch[1].trim();
+    }
+  }
+
+  return '';
+}
+
+// Check if account doesn't exist
+function isNotFound(html) {
+  const patterns = [
+    'Tài khoản này không tồn tại',
+    'không cho phép tìm kiếm',
+    'không tìm thấy',
+    'not found'
+  ];
+
+  const lowerHtml = html.toLowerCase();
+  for (const pattern of patterns) {
+    if (lowerHtml.includes(pattern.toLowerCase())) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 // Main API endpoint
 app.get('/api/zalo', async (req, res) => {
@@ -41,101 +157,27 @@ app.get('/api/zalo', async (req, res) => {
   }
   
   try {
-    console.log(`🔍 Scraping Zalo for ${cleanPhone}...`);
+    console.log(`🔍 Fetching Zalo for ${cleanPhone}...`);
     
-    const browser = await puppeteer.launch({
-      args: chromium.args,
-      defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-    });
+    const html = await fetchZaloPage(cleanPhone);
     
-    const page = await browser.newPage();
+    let name = extractName(html);
+    let status = '';
     
-    // Set user agent
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // Navigate
-    const url = `https://zalo.me/${cleanPhone}`;
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 15000 });
-    
-    // Wait longer for JS to render
-    await page.waitForTimeout(4000);
-    
-    // Extract data
-    const result = await page.evaluate(() => {
-      // Method 1: From <title> tag (MOST RELIABLE)
-      const title = document.title;
-      if (title && title.includes(' - ')) {
-        const name = title.split(' - ')[1]?.replace('Zalo', '').trim();
-        if (name && name.length > 0 && name !== 'Zalo') {
-          return {
-            name: name,
-            status: 'Tồn tại',
-            method: 'title'
-          };
-        }
-      }
-      
-      // Method 2: From rendered content
-      const selectors = [
-        'h1.main__name',
-        '.main__name',
-        'h1[class*="name"]',
-        '[class*="card-name"]'
-      ];
-      
-      for (const selector of selectors) {
-        const element = document.querySelector(selector);
-        if (element && element.textContent.trim()) {
-          return {
-            name: element.textContent.trim(),
-            status: 'Tồn tại',
-            method: selector
-          };
-        }
-      }
-      
-      // Method 3: Check for error message
-      const body = document.body.innerHTML;
-      if (body.includes('Tài khoản này không tồn tại') || 
-          body.includes('không cho phép tìm kiếm')) {
-        return {
-          name: '',
-          status: 'Không tồn tại',
-          method: 'error'
-        };
-      }
-      
-      // Method 4: From meta og:title
-      const metaTitle = document.querySelector('meta[property="og:title"]');
-      if (metaTitle) {
-        const content = metaTitle.getAttribute('content');
-        if (content && content.includes(' - ')) {
-          const name = content.split(' - ')[1]?.replace('Zalo', '').trim();
-          if (name && name.length > 0) {
-            return {
-              name: name,
-              status: 'Tồn tại',
-              method: 'meta'
-            };
-          }
-        }
-      }
-      
-      return {
-        name: '',
-        status: 'Không xác định',
-        method: 'none'
-      };
-    });
-    
-    await browser.close();
+    if (name && name.length > 0) {
+      status = 'Tồn tại';
+    } else if (isNotFound(html)) {
+      status = 'Không tồn tại';
+      name = '';
+    } else {
+      status = 'Không xác định';
+      name = '';
+    }
     
     const response = {
       phone: cleanPhone,
-      name: result.name || '',
-      status: result.status || 'Không xác định',
+      name: name,
+      status: status,
       timestamp: new Date().toISOString()
     };
     
@@ -159,12 +201,28 @@ app.get('/api/zalo', async (req, res) => {
   }
 });
 
+// Debug endpoint - return raw HTML
+app.get('/api/debug', async (req, res) => {
+  const phone = req.query.phone || '0398981698';
+  
+  try {
+    const html = await fetchZaloPage(phone);
+    
+    // Return first 2000 chars
+    res.type('text/plain').send(html.substring(0, 2000));
+    
+  } catch (error) {
+    res.status(500).send('Error: ' + error.message);
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     cache_size: cache.size,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    version: '2.0-simple'
   });
 });
 
@@ -182,10 +240,12 @@ app.post('/cache/clear', (req, res) => {
 // Homepage
 app.get('/', (req, res) => {
   res.json({
-    message: 'Zalo Proxy Server',
+    message: 'Zalo Proxy Server - Simple Version (No Puppeteer)',
+    version: '2.0',
     endpoints: {
       health: '/health',
       api: '/api/zalo?phone=0398981698',
+      debug: '/api/debug?phone=0398981698',
       clearCache: '/cache/clear (POST)'
     }
   });
@@ -193,12 +253,12 @@ app.get('/', (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Zalo Proxy Server running on port ${PORT}`);
+  console.log(`🚀 Zalo Proxy Server (Simple) running on port ${PORT}`);
+  console.log(`📍 Version: No Puppeteer - Direct HTML fetch`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
-  console.log(`📍 API: http://localhost:${PORT}/api/zalo?phone=0398981698`);
 });
 
-// Auto clear old cache every hour
+// Auto clear old cache
 setInterval(() => {
   const now = Date.now();
   let cleared = 0;
